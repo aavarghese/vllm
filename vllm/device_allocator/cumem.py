@@ -9,13 +9,15 @@
 # the only successful approach is to call cuda driver API in C.
 import dataclasses
 from contextlib import contextmanager
+import time
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.utils import is_pin_memory_available
 
-
+logger = init_logger(__name__)
 def find_loaded_library(lib_name) -> Optional[str]:
     """
     According to according to https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html,
@@ -180,13 +182,14 @@ class CuMemAllocator:
             offload_tags = (CuMemAllocator.default_tag, )
         elif isinstance(offload_tags, str):
             offload_tags = (offload_tags, )
-
+        total_cpu_mem = 0
         assert isinstance(offload_tags, tuple)
-
+        logger.info("AAV Number of items in data %s", len(self.pointer_to_data))
         for ptr, data in self.pointer_to_data.items():
             handle = data.handle
             if data.tag in offload_tags:
                 size_in_bytes = handle[1]
+                total_cpu_mem += size_in_bytes
                 cpu_backup_tensor = torch.empty(
                     size_in_bytes,
                     dtype=torch.uint8,
@@ -196,22 +199,30 @@ class CuMemAllocator:
                 libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
                 data.cpu_backup_tensor = cpu_backup_tensor
             unmap_and_release(handle)
+        logger.info("AAV Total size of data offloaded to CPU memory %s", total_cpu_mem)
 
     def wake_up(self):
         """
         Wake up the allocator from sleep mode.
         All data that is previously offloaded will be loaded back to GPU 
         memory, and the rest of the data will have empty memory."""
+        logger.info("Number of items in data %s", len(self.pointer_to_data))
         for ptr, data in self.pointer_to_data.items():
             handle = data.handle
+            time_before_createAndMap = time.perf_counter()
             create_and_map(handle)
+            time_after_createAndMap = time.perf_counter()
+            logger.info("AAV It took %.6f seconds to create and map.", time_after_createAndMap - time_before_createAndMap)
             if data.cpu_backup_tensor is not None:
                 cpu_backup_tensor = data.cpu_backup_tensor
                 if cpu_backup_tensor is not None:
                     size_in_bytes = cpu_backup_tensor.numel(
                     ) * cpu_backup_tensor.element_size()
                     cpu_ptr = cpu_backup_tensor.data_ptr()
+                    time_before_cudaMemcpy = time.perf_counter()
                     libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
+                    time_after_cudaMemcpy = time.perf_counter()
+                    logger.info("AAV It took %.6f seconds to copy cuda mem.", time_after_cudaMemcpy - time_before_cudaMemcpy)
                     data.cpu_backup_tensor = None
 
     @contextmanager
