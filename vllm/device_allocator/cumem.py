@@ -9,11 +9,17 @@
 # the only successful approach is to call cuda driver API in C.
 import dataclasses
 from contextlib import contextmanager
+import hashlib
+import mmap
+import os
 import time
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import torch
+import ctypes
+import numpy as np
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.utils import is_pin_memory_available
 
@@ -145,6 +151,7 @@ class CuMemAllocator:
         self.pointer_to_data: Dict[int, AllocationData] = {}
         self.current_tag: str = CuMemAllocator.default_tag
         self.allocator_and_pools: Dict[str, Any] = {}
+        #self.hash_key = hashlib.md5(str(self.instance).encode()).hexdigest()[:10]
 
     def python_malloc_callback(self, allocation_handle: HandleType) -> None:
         """
@@ -183,9 +190,15 @@ class CuMemAllocator:
         elif isinstance(offload_tags, str):
             offload_tags = (offload_tags, )
         total_cpu_mem = 0
+        offload_dir = os.path.join(
+                envs.VLLM_CACHE_ROOT,
+                "rawtensors_offloaded_for_sleep",
+            )
+        os.makedirs(offload_dir, exist_ok=True)
         assert isinstance(offload_tags, tuple)
         logger.info("AAV Number of items in data %s", len(self.pointer_to_data))
-        for ptr, data in self.pointer_to_data.items():
+
+        for index, (ptr, data) in enumerate(self.pointer_to_data.items()):
             handle = data.handle
             if data.tag in offload_tags:
                 size_in_bytes = handle[1]
@@ -196,8 +209,22 @@ class CuMemAllocator:
                     device='cpu',
                     pin_memory=is_pin_memory_available())
                 cpu_ptr = cpu_backup_tensor.data_ptr()
-                libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
+                libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes) #copy from GPU mem to CPU mem
                 data.cpu_backup_tensor = cpu_backup_tensor
+                
+                #bytes(cpu_backup_tensor.view(torch.uint8))
+
+                data_path = os.path.join(offload_dir, "write_"+str(index)) #copy from CPU mem to disk 1
+                with open(data_path, "wb") as f:
+                    f.seek(size_in_bytes - 1)
+                    f.write(b"\0")
+                with open(data_path, "r+b") as f:
+                    with mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_WRITE) as mm:
+                        ctypes_array = (ctypes.c_uint8 * size_in_bytes).from_address(cpu_ptr)
+                        numpy_array = np.ctypeslib.as_array(ctypes_array, shape=(cpu_backup_tensor.shape,))
+                        mm.write(numpy_array) #TODO: get data from cpu_ptr address in byte format
+                        mm.close()
+            #Need to free CPU mem since persisted on disk
             unmap_and_release(handle)
         logger.info("AAV Total size of data offloaded to CPU memory %s", total_cpu_mem)
 
@@ -206,24 +233,46 @@ class CuMemAllocator:
         Wake up the allocator from sleep mode.
         All data that is previously offloaded will be loaded back to GPU 
         memory, and the rest of the data will have empty memory."""
+        offload_dir = os.path.join(
+            envs.VLLM_CACHE_ROOT,
+            "rawtensors_offloaded_for_sleep",
+        )
         logger.info("Number of items in data %s", len(self.pointer_to_data))
-        for ptr, data in self.pointer_to_data.items():
+        time_before_loadingtoGPU = time.perf_counter()  
+        for index, (ptr, data) in enumerate(self.pointer_to_data.items()):
             handle = data.handle
-            time_before_createAndMap = time.perf_counter()
             create_and_map(handle)
-            time_after_createAndMap = time.perf_counter()
-            logger.info("AAV It took %.6f seconds to create and map.", time_after_createAndMap - time_before_createAndMap)
-            if data.cpu_backup_tensor is not None:
-                cpu_backup_tensor = data.cpu_backup_tensor
-                if cpu_backup_tensor is not None:
-                    size_in_bytes = cpu_backup_tensor.numel(
-                    ) * cpu_backup_tensor.element_size()
-                    cpu_ptr = cpu_backup_tensor.data_ptr()
-                    time_before_cudaMemcpy = time.perf_counter()
-                    libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
-                    time_after_cudaMemcpy = time.perf_counter()
-                    logger.info("AAV It took %.6f seconds to copy cuda mem.", time_after_cudaMemcpy - time_before_cudaMemcpy)
-                    data.cpu_backup_tensor = None
+
+            time_before_mmap = time.perf_counter()
+            data_path = os.path.join(offload_dir, "write_"+str(index)) #read from disk 1
+            with open(data_path, mode="r") as f:
+                with mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ) as mmap_obj:
+                    cpu_backup_tensor =  torch.from_numpy(np.frombuffer(mmap_obj, dtype=np.uint8))
+                    if cpu_backup_tensor is not None:
+                        size_in_bytes = cpu_backup_tensor.numel(
+                        ) * cpu_backup_tensor.element_size()
+                        cpu_ptr = cpu_backup_tensor.data_ptr()
+                        libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
+                        data.cpu_backup_tensor = None
+                    del cpu_backup_tensor
+                    mmap_obj.close()
+            time_after_mmap = time.perf_counter()
+            logger.info("AAV It took %.6f seconds to mmap read.", time_after_mmap - time_before_mmap)
+            
+            #copy data from CPU mem to GPU (not done)
+            # if data.cpu_backup_tensor is not None:
+            #     cpu_backup_tensor = data.cpu_backup_tensor
+            #     if cpu_backup_tensor is not None:
+            #         size_in_bytes = cpu_backup_tensor.numel(
+            #         ) * cpu_backup_tensor.element_size()
+            #         cpu_ptr = cpu_backup_tensor.data_ptr()
+            #         time_before_cudaMemcpy = time.perf_counter()
+            #         libcudart.cudaMemcpy(ptr, cpu_ptr, size_in_bytes)
+            #         time_after_cudaMemcpy = time.perf_counter()
+            #         #logger.info("AAV It took %.6f seconds to copy cuda mem.", time_after_cudaMemcpy - time_before_cudaMemcpy)
+            #         data.cpu_backup_tensor = None
+        time_after_loadingtoGPU  = time.perf_counter()
+        logger.info("AAV It took %.6f seconds to reload back to GPU during wake_up.", time_after_loadingtoGPU  - time_before_loadingtoGPU )
 
     @contextmanager
     def use_memory_pool(self, tag: Optional[str] = None):
