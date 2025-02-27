@@ -4,6 +4,7 @@ import gc
 import os
 from typing import TYPE_CHECKING, Optional, Set
 
+import time
 import torch
 import torch.distributed
 import torch.nn as nn
@@ -83,7 +84,11 @@ class Worker(WorkerBase):
             used_bytes / GiB_bytes)
 
     def wake_up(self) -> None:
+        time_before_getAlloc = time.perf_counter()
         allocator = CuMemAllocator.get_instance()
+        time_after_getAlloc = time.perf_counter()
+        logger.info("AAV It took %.6f seconds to get alloc instancep.",
+                    time_after_getAlloc - time_before_getAlloc)
         allocator.wake_up()
 
     def init_device(self):
